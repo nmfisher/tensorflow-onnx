@@ -109,8 +109,6 @@ FUNCTION_ATTRS = ['then_subgraph_index', 'else_subgraph_index', 'cond_subgraph_i
                   'body_subgraph_index', 'subgraph']
 FUNCTION_ATTRS = [snake_to_proper_case(attr) for attr in FUNCTION_ATTRS]
 
-VAR_OPS_TO_KEEP_OUTPUT = ["TFL_READ_VARIABLE"]
-VAR_OPS_UNUSED = ["TFL_READ_VARIABLE", "TFL_VAR_HANDLE"]
 
 enum_cache = {}
 def lookup_enum(idx, enum_name):
@@ -151,7 +149,7 @@ def graphs_from_tflite(tflite_path, input_names=None, output_names=None):
         tensor_shapes_from_interpreter = None
         if is_main_g:
             tensor_shapes_from_interpreter = tensor_shapes
-        onnx_nodes, _, _, output_shapes, dtypes, f_inputs, f_outputs, graph_name = \
+        onnx_nodes, _, _, output_shapes, dtypes, f_inputs, f_outputs, graph_name, var_map = \
             parse_tflite_graph(tfl_graph, opcodes, model, prefix, tensor_shapes_from_interpreter)
         g_inputs = f_inputs
         g_outputs = f_outputs
@@ -164,7 +162,7 @@ def graphs_from_tflite(tflite_path, input_names=None, output_names=None):
                 g_outputs = output_names
         g = Graph(onnx_nodes, output_shapes, dtypes, input_names=g_inputs, output_names=g_outputs,
                   is_subgraph=not is_main_g, graph_name=graph_name)
-        process_variable_ops(g)
+        process_variable_ops(g, var_map)
         if is_main_g:
             main_g = g
         else:
@@ -172,38 +170,32 @@ def graphs_from_tflite(tflite_path, input_names=None, output_names=None):
     return main_g, subgraphs
 
 
-def process_variable_ops(g):
-    replace_var_ops_with_const(g, VAR_OPS_TO_KEEP_OUTPUT)
-    remove_unused_nodes(g, VAR_OPS_UNUSED)
-
-
-def replace_var_ops_with_const(g, var_op_types):
+def process_variable_ops(g, var_map):
+    '''For every op that has a TFL_READ_VARIABLE node output as its input, replace the input name with the name of placeholder node.
+    Placeholders have already been added to the graph in parse_tflite_graph, named according to the graph output that was fed into the corresponding AssignVariable op (i.e. the "input" to AssignVariable).
+    var_map is a lookup where the values are these placeholder names and the keys are the names of the VarHandle that each AssignVariable op assigned to (i.e. the "output" from AssignVariable).
+    This lets us retrieve the corresponding placeholder name for each TFL_READ_VARIABLE input_name.
+    We then delete all TFL_VAR_HANDLE ops.
+'''
     ops = g.get_nodes()
-    input_const_nodes = {}
-
+    replacement_nodes = {}
+    removed_nodes = []
     for op in ops:
-        if op.type in var_op_types:
-            if op.output[0] in input_const_nodes:
+        if op.type == "TFL_READ_VARIABLE":
+            if op.output[0] in replacement_nodes:
                 continue;
             node_shape = g.get_shape(op.output[0])
             node_dtype = g.get_dtype(op.output[0])
-            input_const_nodes[op.output[0]] = g.make_const(utils.make_name("var_const"), 
-                                                           np.zeros(node_shape, 
-                                                           dtype=utils.map_onnx_to_numpy_type(node_dtype)))
-
+            replacement_nodes[op.output[0]] = var_map[op.input[0].split("_raw_output___")[0]]
+            removed_nodes.append(op.name)
+        elif op.type == "TFL_VAR_HANDLE":
+            removed_nodes.append(op.name)
     for op in ops:
         for i, inp in enumerate(op.input):
-            if inp in input_const_nodes:
-                g.replace_input(op, inp, input_const_nodes[inp].output[0], input_index=i)
-
-
-def remove_unused_nodes(g, node_types):
-    ops = g.get_nodes()
-    removed_nodes = []
-    for op in ops:
-        if op.type in node_types:
-            removed_nodes.append(op.name)
-
+            if inp in replacement_nodes:
+                g.replace_input(op, inp, replacement_nodes[inp], input_index=i)
+                g.copy_dtype(inp, replacement_nodes[inp])
+                g.copy_shape(inp, replacement_nodes[inp])
     for node_name in removed_nodes:
         g.remove_node(node_name)
 
@@ -430,6 +422,9 @@ def parse_tflite_graph(tflite_g, opcodes_map, model, input_prefix='', tensor_sha
         dtypes[prequant_name] = onnx_pb.TensorProto.FLOAT
         return prequant_name
 
+    assign_from_to={}
+    read_from_to={}
+    
     for i in range(tflite_g.OperatorsLength()):
         op = tflite_g.Operators(i)
         optype = 'TFL_' + opcodes_map[op.OpcodeIndex()]
@@ -524,14 +519,23 @@ def parse_tflite_graph(tflite_g, opcodes_map, model, input_prefix='', tensor_sha
         if len(output_names) > 0: # to try to hackily work around this error: https://github.com/onnx/tensorflow-onnx/issues/2055
             onnx_node = helper.make_node(optype, input_names, output_names, name=output_names[0], **attr)
             onnx_nodes.append(onnx_node)
-
-    inputs = [tensor_names[tflite_g.Inputs(i)] for i in range(tflite_g.InputsLength())]
-    outputs = [tensor_names[tflite_g.Outputs(i)] for i in range(tflite_g.OutputsLength())]
-    # TODO: Allow input/outputs to be overridden
-
+        if "ASSIGN_VARIABLE" in optype:
+            assign_from_to[input_names[1]] = input_names[0] 
+            print(f" {optype} input_names {input_names} output_names {output_names} ")
+        elif "READ_VARIABLE" in optype:
+            read_from_to[input_names[0]] = output_names[0]
+            print(f" {optype} input_names {input_names} output_names {output_names} ")
+    inputs = [tensor_names[tflite_g.Inputs(i)] for i in range(tflite_g.InputsLength())] 
+    outputs = [tensor_names[tflite_g.Outputs(i)] for i in range(tflite_g.OutputsLength())]  + list(assign_from_to.keys())
+    output_input_map = {}   
+    for assign_from,assign_to in assign_from_to.items():
+        input_name = assign_from + "_inp"
+        onnx_node = helper.make_node("Placeholder", [], outputs=[input_name], name=input_name)
+        print(onnx_node)
+        onnx_nodes.append(onnx_node)
+        output_input_map[assign_to] = input_name
     for inp in inputs:
         onnx_node = helper.make_node("Placeholder", [], outputs=[inp], name=inp)
         onnx_nodes.append(onnx_node)
-
     graph_name = (tflite_g.Name() or b'tflite graph').decode()
-    return onnx_nodes, op_cnt, attr_cnt, output_shapes, dtypes, inputs, outputs, graph_name
+    return onnx_nodes, op_cnt, attr_cnt, output_shapes, dtypes, inputs, outputs, graph_name, output_input_map
